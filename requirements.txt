@@ -1,0 +1,5 @@
+paho-mqtt>=2.0
+joblib
+scikit-learn
+pandas
+numpy
