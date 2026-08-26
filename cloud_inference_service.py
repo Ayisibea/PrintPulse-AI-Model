@@ -8,23 +8,39 @@ back to a status topic.
 Run this as a small always-on process (Oracle Cloud free-tier VM via
 systemd, or any other always-on host).
 
-NOTE: credentials are hardcoded below since this repo is private. If the
-repo's visibility ever changes, rotate the HiveMQ password and update it
-here.
+Credentials are read from environment variables (see .env.example) — never
+hardcode them here, even in a private repo. Repo visibility can change,
+collaborators can be added, and forks/clones outlive access decisions.
 """
 
 import json
+import os
+import sys
+
 import joblib
 import numpy as np
 import paho.mqtt.client as mqtt
 
 MODEL_PATH = "printer_fault_model.joblib"
 
-# --- HiveMQ Cloud credentials ---
-MQTT_HOST = "152fa86b7709460f8c860cd2732d9920.s1.eu.hivemq.cloud"
-MQTT_PORT = 8883
-MQTT_USERNAME = "PrintPulse"
-MQTT_PASSWORD = "FinalYearProject@2026"
+# --- HiveMQ Cloud credentials (from environment) ---
+MQTT_HOST = os.environ.get("MQTT_HOST")
+MQTT_PORT = int(os.environ.get("MQTT_PORT", "8883"))
+MQTT_USERNAME = os.environ.get("MQTT_USERNAME")
+MQTT_PASSWORD = os.environ.get("MQTT_PASSWORD")
+
+_required = {
+    "MQTT_HOST": MQTT_HOST,
+    "MQTT_USERNAME": MQTT_USERNAME,
+    "MQTT_PASSWORD": MQTT_PASSWORD,
+}
+_missing = [name for name, val in _required.items() if not val]
+if _missing:
+    sys.exit(
+        f"Missing required environment variable(s): {', '.join(_missing)}. "
+        f"Set them (e.g. via a .env file loaded by your process manager, or "
+        f"`export VAR=value`) before running this service."
+    )
 
 # --- Topics: matching the ESP32 sketch exactly (single printer, flat topics) ---
 FEATURES_TOPIC = "printpulse/features"
@@ -35,6 +51,7 @@ PRINTER_ID = "printpulse_esp32"  # tag for logs/status payload; no per-device wi
 # alert, rather than a single noisy misfire -- tune this once you see live
 # behaviour.
 CONSECUTIVE_THRESHOLD = 3
+
 _consecutive_fault_count = 0
 
 
@@ -56,7 +73,6 @@ def predict(feature_dict: dict) -> dict:
 
     x = np.array([[feature_dict[c] for c in BUNDLE["feature_cols"]]])
     x_scaled = BUNDLE["scaler"].transform(x)
-
     pred_label = BUNDLE["model"].predict(x_scaled)[0]
     proba = BUNDLE["model"].predict_proba(x_scaled)[0]
     class_probs = dict(zip(BUNDLE["model"].classes_, proba.round(3)))
@@ -79,7 +95,6 @@ def on_connect(client, userdata, flags, rc, properties=None):
 
 def on_message(client, userdata, msg):
     global _consecutive_fault_count
-
     try:
         payload = json.loads(msg.payload.decode("utf-8"))
     except json.JSONDecodeError:
@@ -98,6 +113,7 @@ def on_message(client, userdata, msg):
         _consecutive_fault_count += 1
     else:
         _consecutive_fault_count = 0
+
     result["consecutive_fault_windows"] = _consecutive_fault_count
     result["alert"] = _consecutive_fault_count >= CONSECUTIVE_THRESHOLD
     result["printer_id"] = PRINTER_ID
@@ -115,7 +131,6 @@ def main():
     client.tls_set()  # HiveMQ Cloud requires TLS on port 8883
     client.on_connect = on_connect
     client.on_message = on_message
-
     client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
     client.loop_forever()
 
