@@ -1,6 +1,6 @@
 paho-mqtt>=2.0
 joblib
-scikit-learn
+scikit-learn==1.8.0
 pandas
 numpy
 flask
