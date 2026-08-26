@@ -1,9 +1,12 @@
 """
 Cloud inference service for the printer fault-detection model (PrintPulse).
 
-Subscribes to the HiveMQ topic where the ESP32 publishes computed feature
-vectors, runs them through the trained model, and publishes the prediction
-back to a status topic.
+Subscribes to two HiveMQ topics:
+  - printpulse/features: ESP32-computed vibration feature vectors (16 keys)
+  - printpulse/printer:  PC-polled nozzle/bed temperature readings
+
+Merges the latest temperature reading into each vibration feature vector
+before running a prediction, and publishes the result to a status topic.
 
 Run this as a small always-on process (Oracle Cloud free-tier VM via
 systemd, or any other always-on host).
@@ -16,6 +19,7 @@ collaborators can be added, and forks/clones outlive access decisions.
 import json
 import os
 import sys
+import time
 
 import joblib
 import numpy as np
@@ -42,8 +46,9 @@ if _missing:
         f"`export VAR=value`) before running this service."
     )
 
-# --- Topics: matching the ESP32 sketch exactly (single printer, flat topics) ---
+# --- Topics ---
 FEATURES_TOPIC = "printpulse/features"
+PRINTER_TOPIC = "printpulse/printer"
 STATUS_TOPIC = "printpulse/status"
 PRINTER_ID = "printpulse_esp32"  # tag for logs/status payload; no per-device wildcarding needed
 
@@ -52,7 +57,14 @@ PRINTER_ID = "printpulse_esp32"  # tag for logs/status payload; no per-device wi
 # behaviour.
 CONSECUTIVE_THRESHOLD = 3
 
+# how old a temperature reading is allowed to be before we refuse to use it
+# for a prediction (PC poller publishes roughly every ~6s, so this gives
+# margin for a couple of missed cycles without silently going stale forever)
+TEMP_STALENESS_LIMIT_SEC = 15
+
 _consecutive_fault_count = 0
+_latest_temps = {"nozzle_temp": None, "bed_temp": None}
+_latest_temp_timestamp = 0
 
 
 def load_model_bundle(path: str = MODEL_PATH):
@@ -87,42 +99,66 @@ def predict(feature_dict: dict) -> dict:
 
 def on_connect(client, userdata, flags, rc, properties=None):
     if rc == 0:
-        print(f"Connected to {MQTT_HOST}. Subscribing to {FEATURES_TOPIC}")
+        print(f"Connected to {MQTT_HOST}. Subscribing to {FEATURES_TOPIC} and {PRINTER_TOPIC}")
         client.subscribe(FEATURES_TOPIC, qos=1)
+        client.subscribe(PRINTER_TOPIC, qos=1)
     else:
         print(f"Connection failed, rc={rc}")
 
 
 def on_message(client, userdata, msg):
-    global _consecutive_fault_count
-    try:
-        payload = json.loads(msg.payload.decode("utf-8"))
-    except json.JSONDecodeError:
-        print(f"Bad JSON on {msg.topic}, skipping")
-        return
+    global _consecutive_fault_count, _latest_temp_timestamp
 
-    try:
-        result = predict(payload)
-    except ValueError as e:
-        print(f"[{PRINTER_ID}] {e}")
-        return
+    if msg.topic == PRINTER_TOPIC:
+        try:
+            temp_payload = json.loads(msg.payload.decode("utf-8"))
+            _latest_temps["nozzle_temp"] = temp_payload["nozzle_actual"]
+            _latest_temps["bed_temp"] = temp_payload["bed_actual"]
+            _latest_temp_timestamp = time.time()
+        except (json.JSONDecodeError, KeyError) as e:
+            print(f"Bad printer payload: {e}")
+        return  # nothing to predict on a temp-only message
 
-    # simple debounce: only escalate to an "alert" after N consecutive
-    # fault predictions in a row, to avoid reacting to a single noisy window
-    if result["is_fault"]:
-        _consecutive_fault_count += 1
-    else:
-        _consecutive_fault_count = 0
+    if msg.topic == FEATURES_TOPIC:
+        if _latest_temps["nozzle_temp"] is None:
+            print("No temperature reading yet, skipping prediction")
+            return
 
-    result["consecutive_fault_windows"] = _consecutive_fault_count
-    result["alert"] = _consecutive_fault_count >= CONSECUTIVE_THRESHOLD
-    result["printer_id"] = PRINTER_ID
+        temp_age = time.time() - _latest_temp_timestamp
+        if temp_age > TEMP_STALENESS_LIMIT_SEC:
+            print(f"Temp reading is {temp_age:.0f}s old, skipping prediction")
+            return
 
-    client.publish(STATUS_TOPIC, json.dumps(result), qos=1)
+        try:
+            vibe_payload = json.loads(msg.payload.decode("utf-8"))
+        except json.JSONDecodeError:
+            print(f"Bad JSON on {msg.topic}, skipping")
+            return
 
-    tag = "ALERT" if result["alert"] else ("fault?" if result["is_fault"] else "ok")
-    print(f"[{PRINTER_ID}] {tag:6s} -> {result['predicted_label']:16s} "
-          f"(conf={result['confidence']:.2f}, streak={result['consecutive_fault_windows']})")
+        feature_dict = {**vibe_payload, **_latest_temps}
+
+        try:
+            result = predict(feature_dict)
+        except ValueError as e:
+            print(f"[{PRINTER_ID}] {e}")
+            return
+
+        # simple debounce: only escalate to an "alert" after N consecutive
+        # fault predictions in a row, to avoid reacting to a single noisy window
+        if result["is_fault"]:
+            _consecutive_fault_count += 1
+        else:
+            _consecutive_fault_count = 0
+
+        result["consecutive_fault_windows"] = _consecutive_fault_count
+        result["alert"] = _consecutive_fault_count >= CONSECUTIVE_THRESHOLD
+        result["printer_id"] = PRINTER_ID
+
+        client.publish(STATUS_TOPIC, json.dumps(result), qos=1)
+
+        tag = "ALERT" if result["alert"] else ("fault?" if result["is_fault"] else "ok")
+        print(f"[{PRINTER_ID}] {tag:6s} -> {result['predicted_label']:16s} "
+              f"(conf={result['confidence']:.2f}, streak={result['consecutive_fault_windows']})")
 
 
 def main():
